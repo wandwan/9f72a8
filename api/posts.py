@@ -4,9 +4,10 @@ from api import api
 from db.shared import db
 from db.models.user_post import UserPost
 from db.models.post import Post
-
+from db.models.user import User
 from db.utils import row_to_dict
 from middlewares import auth_required
+from sqlalchemy.orm.exc import UnmappedInstanceError
 
 
 @api.post("/posts")
@@ -37,3 +38,104 @@ def posts():
     db.session.commit()
 
     return row_to_dict(post), 200
+
+
+@api.route("/posts/<int:postId>", methods=["PATCH"])
+@auth_required
+def update(postId):
+    # validation
+    user = g.get("user")
+    post = Post.query.get(postId)
+    authors = UserPost.query.filter(UserPost.post_id == postId).all()
+    if user is None:
+        return abort(401)
+
+    if post is None:
+        return jsonify({"error": "Post not found"}), 404
+
+    if user.id not in [author.user_id for author in authors]:
+        return jsonify({"error": "You are not authorized to update this post"}), 401
+
+    # get data
+    data = request.get_json(force=True)
+    authorIds = data.get("authorIds", None)
+    text = data.get("text", None)
+    tags = data.get("tags", None)
+
+    # return error for invalid fields
+    if authorIds:
+        if not isinstance(authorIds, list):
+            return jsonify({"error": "Invalid type, authorIds is not an array"}), 400
+        try:
+            authorIds = [int(elem) for elem in authorIds]
+        except Exception as e:
+            return jsonify({"error": "Invalid type, non integer in authorIds"}), 400
+
+    if tags and not isinstance(tags, list):
+        return jsonify({"error": "Invalid type, tags is not an array"}), 400
+
+    if authorIds:
+        # Remove all authors
+        UserPost.query.filter(UserPost.post_id == postId).delete()
+        db.session.commit()
+
+        # Add new authors
+        for authorId in authorIds:
+            # check if user exists
+            user = User.query.get(authorId)
+            if user is None:
+                return jsonify({"error": "Non-existant user in authorIds"}), 400
+
+            user_post = UserPost(user_id=authorId, post_id=postId)
+            db.session.add(user_post)
+            db.session.commit()
+
+    # Update post
+    if text:
+        post.text = text
+    if tags:
+        post.tags = tags
+    db.session.commit()
+
+    # add authors to post
+    toRet = row_to_dict(post)
+    toRet["authorIds"] = [author.user_id for author in UserPost.query.filter(
+        UserPost.post_id == postId)]
+
+    return jsonify({"post": toRet}), 200
+
+
+@api.get("/posts")
+@auth_required
+def fetch():
+    """
+    Fetch all posts for a given author
+    """
+    # validation
+    user = g.get("user")
+    if user is None:
+        return abort(401)
+
+    # parse query params
+    authorIds = request.args.get("authorIds", None).split(",")
+    sortBy = request.args.get("sortBy", "id")
+    direction = request.args.get("direction", "asc")
+
+    if(sortBy not in ["id", "reads", "likes", "popularity"]):
+        return jsonify({"error": "Invalid sortBy parameter"}), 400
+
+    if(direction not in ["asc", "desc"]):
+        return jsonify({"error": "Invalid direction parameter"}), 400
+    # fetch posts
+    posts = set()
+    for authorId in authorIds:
+        try:
+            posts.update(Post.get_posts_by_user_id(authorId))
+        except UnmappedInstanceError:
+            pass
+
+    # sort posts
+    posts = sorted(posts, key=lambda x: getattr(
+                   x, sortBy), reverse=(direction == "desc"))
+
+    return jsonify({'posts': [row_to_dict(post) for post in posts]}), 200
