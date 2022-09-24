@@ -1,3 +1,4 @@
+from http.client import UNAUTHORIZED
 from flask import jsonify, request, g, abort
 
 from api import api
@@ -9,6 +10,10 @@ from db.utils import row_to_dict
 from middlewares import auth_required
 from sqlalchemy.orm.exc import UnmappedInstanceError
 
+SORTABLE_PROPERTIES = ["id", "reads", "likes", "popularity"]
+SORT_DIRECTIONS = ["asc", "desc"]
+UNAUTHORIZED_MESSAGE = "Unathorized Access. Not Logged In"
+
 
 @api.post("/posts")
 @auth_required
@@ -16,7 +21,7 @@ def posts():
     # validation
     user = g.get("user")
     if user is None:
-        return abort(401)
+        return abort(401, UNAUTHORIZED_MESSAGE)
 
     data = request.get_json(force=True)
     text = data.get("text", None)
@@ -48,13 +53,13 @@ def update(postId):
     post = Post.query.get(postId)
     authors = UserPost.query.filter(UserPost.post_id == postId).all()
     if user is None:
-        return abort(401)
+        return abort(401, UNAUTHORIZED_MESSAGE)
 
     if post is None:
         return jsonify({"error": "Post not found"}), 404
 
     if user.id not in [author.user_id for author in authors]:
-        return jsonify({"error": "You are not authorized to update this post"}), 401
+        return jsonify({"error": "You are not authorized to update this post"}), 403
 
     # get data
     data = request.get_json(force=True)
@@ -74,23 +79,21 @@ def update(postId):
     if tags and not isinstance(tags, list):
         return jsonify({"error": "Invalid type, tags is not an array"}), 400
 
+    # remove duplicate authorIds
+    authorIds = list(set(authorIds))
+
+    # update authors and post
     if authorIds:
-        # Remove all authors
-        UserPost.query.filter(UserPost.post_id == postId).delete()
+        currAuthors = UserPost.query.filter(UserPost.post_id == postId)
+        # remove authors that are not in authorIds
+        currAuthors.filter(UserPost.user_id.notin_(authorIds)).delete()
+        # filter and add authors that are not in currAuthors
+        authorIds = [
+            UserPost(user_id=authorId, post_id=postId) for authorId in authorIds
+            if authorId not in [author.user_id for author in currAuthors]]
+        db.session.add_all(authorIds)
         db.session.commit()
 
-        # Add new authors
-        for authorId in authorIds:
-            # check if user exists
-            user = User.query.get(authorId)
-            if user is None:
-                return jsonify({"error": "Non-existant user in authorIds"}), 400
-
-            user_post = UserPost(user_id=authorId, post_id=postId)
-            db.session.add(user_post)
-            db.session.commit()
-
-    # Update post
     if text:
         post.text = text
     if tags:
@@ -98,11 +101,11 @@ def update(postId):
     db.session.commit()
 
     # add authors to post
-    toRet = row_to_dict(post)
-    toRet["authorIds"] = [author.user_id for author in UserPost.query.filter(
-        UserPost.post_id == postId)]
+    updatedPost = row_to_dict(post)
+    updatedPost["authorIds"] = sorted([author.user_id for author in UserPost.query.filter(
+        UserPost.post_id == postId)])
 
-    return jsonify({"post": toRet}), 200
+    return jsonify({"post": updatedPost}), 200
 
 
 @api.get("/posts")
@@ -114,17 +117,17 @@ def fetch():
     # validation
     user = g.get("user")
     if user is None:
-        return abort(401)
+        return abort(401, UNAUTHORIZED_MESSAGE)
 
     # parse query params
     authorIds = request.args.get("authorIds", None).split(",")
     sortBy = request.args.get("sortBy", "id")
     direction = request.args.get("direction", "asc")
-
-    if(sortBy not in ["id", "reads", "likes", "popularity"]):
+    authorIds = [s for s in authorIds if s.isdigit()]
+    if(sortBy not in SORTABLE_PROPERTIES):
         return jsonify({"error": "Invalid sortBy parameter"}), 400
 
-    if(direction not in ["asc", "desc"]):
+    if(direction not in SORT_DIRECTIONS):
         return jsonify({"error": "Invalid direction parameter"}), 400
     # fetch posts
     posts = set()
@@ -134,7 +137,7 @@ def fetch():
         except UnmappedInstanceError:
             pass
 
-    # sort posts
+    # sort posts with sorted method
     posts = sorted(posts, key=lambda x: getattr(
                    x, sortBy), reverse=(direction == "desc"))
 
