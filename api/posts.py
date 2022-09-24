@@ -80,7 +80,8 @@ def update(postId):
         return jsonify({"error": "Invalid type, tags is not an array"}), 400
 
     # remove duplicate authorIds
-    authorIds = list(set(authorIds))
+    if authorIds:
+        authorIds = list(set(authorIds))
 
     # update authors and post
     if authorIds:
